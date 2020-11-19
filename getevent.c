@@ -11,6 +11,7 @@
 #include <getopt.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "getevent.h"
 
