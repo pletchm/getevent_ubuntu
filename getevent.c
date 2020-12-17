@@ -7,6 +7,7 @@
 #include <sys/ioctl.h>
 #include <sys/inotify.h>
 #include <sys/poll.h>
+#include <sys/stat.h>
 #include <linux/input.h>
 #include <getopt.h>
 #include <time.h>
@@ -14,6 +15,13 @@
 #include <unistd.h>
 
 #include "getevent.h"
+
+#define DAEMON_PID_FILE "getevent.pid"
+#define DAEMON_LOG_FILE "getevent.log"
+
+static int daemon_pid_file_fd = -1; /* Set to an invalid file descriptor */
+static FILE *fp_daemon_log_file = NULL;
+static FILE *daemon_pid_file_fp = NULL;
 
 static struct pollfd *ufds;
 static char **device_names;
@@ -243,19 +251,19 @@ static void print_event(int type, int code, int value, int print_flags)
         }
 
         if (type_label)
-            printf("%-12.12s", type_label);
+            fprintf(fp_daemon_log_file, "%-12.12s", type_label);
         else
-            printf("%04x        ", type);
+            fprintf(fp_daemon_log_file, "%04x        ", type);
         if (code_label)
-            printf(" %-20.20s", code_label);
+            fprintf(fp_daemon_log_file, " %-20.20s", code_label);
         else
-            printf(" %04x                ", code);
+            fprintf(fp_daemon_log_file, " %04x                ", code);
         if (value_label)
-            printf(" %-20.20s", value_label);
+            fprintf(fp_daemon_log_file, " %-20.20s", value_label);
         else
-            printf(" %08x            ", value);
+            fprintf(fp_daemon_log_file, " %08x            ", value);
     } else {
-        printf("%04x %04x %08x", type, code, value);
+        fprintf(fp_daemon_log_file, "%04x %04x %08x", type, code, value);
     }
 }
 
@@ -495,6 +503,107 @@ static void usage(char *name)
     fprintf(stderr, "    -r: print rate events are received\n");
 }
 
+void logging_fp_daemon_log_file_set(FILE *file) {
+	fp_daemon_log_file = file;
+}
+
+int daemon_log_open(char *daemon_log_file) {
+    errno = 0;
+    fp_daemon_log_file = fopen(daemon_log_file, "a");
+
+    int ret = 0;
+    if (fp_daemon_log_file == NULL) {
+        fprintf(stderr, "Could not open file %s (errno: %d)\n",
+            daemon_log_file, errno);
+        goto fail;
+    } else {
+        logging_fp_daemon_log_file_set(fp_daemon_log_file);
+        ret = fprintf(fp_daemon_log_file,
+"==========================================================================\n");
+        if (ret <= -1) {
+            fprintf(stderr, "File opened: %s\n", daemon_log_file);
+            goto fail;
+        }
+        fprintf(fp_daemon_log_file, "GetEvent starting up in daemon mode\n\n");
+    }
+
+    fflush(fp_daemon_log_file);
+
+    dup2(fileno(fp_daemon_log_file), STDOUT_FILENO);
+    dup2(fileno(fp_daemon_log_file), STDERR_FILENO);
+
+    return(0);
+fail:
+    return(1);
+}
+
+int daemonize(char *pid_file)
+{
+    pid_t process_id = 0;
+    pid_t sid = 0;
+
+    printf("Daemon Mode\n");
+
+    daemon_pid_file_fp = fopen(pid_file, "w+");
+    if (daemon_pid_file_fp == NULL) {
+        fprintf(stderr, "Could not open pid file %s\n", pid_file);
+    }
+    /* Create child process */
+    process_id = fork();
+
+    /* Indication of fork() failure */
+    if (process_id < 0) {
+        fprintf(stderr, "fork failed!\n");
+        /* Return failure in exit status */
+        fclose(daemon_pid_file_fp);
+        goto fail;
+    }
+
+    /* Parent process. Need to kill it. */
+    if (process_id > 0) {
+        printf("process_id of child process %d \n", process_id);
+        fprintf(daemon_pid_file_fp, "%d\n", process_id);
+        fclose(daemon_pid_file_fp);
+        /*
+         * Dont block context switches,
+         * Let the process sleep for some time.
+         */
+        sleep(2);
+        /* return success in exit status */
+        exit(0);
+    }
+
+    fprintf(fp_daemon_log_file, "child process is running\n");
+
+    /* Set new session. */
+    sid = setsid();
+
+    /* unmask the file mode */
+    umask(0);
+
+    if (sid < 0) {
+        fclose(daemon_pid_file_fp);
+        /* Return failure */
+        exit(4);
+    }
+
+    /*
+     * Close stdin, stdout, and stderr. Since we are no longer attached
+     * to a shell these are not needed.
+     */
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    /*
+     * Dont block context switches,
+     * Let the process sleep for some time.
+     */
+    return 0 ;
+
+fail:
+    return 1 ;
+}
+
 int main(int argc, char *argv[])
 {
     int c;
@@ -514,12 +623,32 @@ int main(int argc, char *argv[])
     const char *device = NULL;
     const char *device_path = "/dev/input";
 
+    static int daemon_flag = 0;
+
     opterr = 0;
     do {
-        c = getopt(argc, argv, "tns:Sv::dpilqc:rh");
+        static struct option long_options[] = {
+            {"daemon", no_argument, 0, 0},
+            {"help",   no_argument, 0, 'h'},
+            {0,        0,           0, 0}
+        };
+
+        int option_index = 0;
+
+        c = getopt_long(argc, argv, "tns:Sv::dpilqc:rh", long_options,
+                        &option_index);
+
         if (c == EOF)
             break;
         switch (c) {
+        case 0:
+            if (strcmp(long_options[option_index].name, "help") == 0) {
+                usage(argv[0]);
+                exit(1);
+            } else if (strcmp(long_options[option_index].name, "daemon") == 0) {
+                daemon_flag = 1;
+            }
+            break;
         case 't':
             get_time = 1;
             break;
@@ -591,6 +720,22 @@ int main(int argc, char *argv[])
         usage(argv[0]);
         exit(1);
     }
+
+   if (daemon_flag) {
+        if (daemon_log_open(DAEMON_LOG_FILE)) {
+            fprintf(stderr,
+                "Could not open getevent log file for daemon mode.\n");
+            abort();
+        }
+
+        if (daemonize(DAEMON_PID_FILE) == 1) {
+            fprintf(stderr, "Could not get PID file lock.\n");
+            abort();
+        }
+    } else {
+        logging_fp_daemon_log_file_set(stdout);
+    }
+
     nfds = 1;
     ufds = calloc(1, sizeof(ufds[0]));
     ufds[0].fd = inotify_init();
@@ -650,18 +795,19 @@ int main(int argc, char *argv[])
                         return 1;
                     }
                     if(get_time) {
-                        printf("[%8ld.%06ld] ", event.time.tv_sec, event.time.tv_usec);
+                        fprintf(fp_daemon_log_file, "[%8ld.%06ld] ", event.time.tv_sec, event.time.tv_usec);
                     }
                     if(print_device)
-                        printf("%s: ", device_names[i]);
+                        fprintf(fp_daemon_log_file, "%s: ", device_names[i]);
                     print_event(event.type, event.code, event.value, print_flags);
                     if(sync_rate && event.type == 0 && event.code == 0) {
                         int64_t now = event.time.tv_sec * 1000000LL + event.time.tv_usec;
                         if(last_sync_time)
-                            printf(" rate %lld", 1000000LL / (now - last_sync_time));
+                            fprintf(fp_daemon_log_file, " rate %lld", 1000000LL / (now - last_sync_time));
                         last_sync_time = now;
                     }
-                    printf("%s", newline);
+                    fprintf(fp_daemon_log_file, "%s", newline);
+                    fflush(fp_daemon_log_file);
                     if(event_count && --event_count == 0)
                         return 0;
                 }

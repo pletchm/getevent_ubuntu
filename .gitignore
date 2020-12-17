@@ -1,0 +1,7 @@
+# Executable
+getevent
+
+# Daemon Artifacts
+*.pid
+*.log
+
